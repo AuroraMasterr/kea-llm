@@ -1,0 +1,7 @@
+a = set()
+a.add("1")
+a.add("2")
+print(a)
+a.add("4")
+print(a)
+print("\n".join(a))
