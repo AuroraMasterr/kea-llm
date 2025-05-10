@@ -676,6 +676,17 @@ class LLMPolicy(KeaInputPolicy):        # use LLM to generate input when detecte
                         event = self.generate_llm_event()
                     else:
                         event = self.generate_random_event()
+
+                    self.activity_history.append(self.from_state.foreground_activity)
+                    self.activity_set.add(self.from_state.foreground_activity)
+                    if len(self.activity_history) == len(self.action_history)+1 :
+                        self.action_history.append(event.__str__())
+                    
+                    print(f"len1:{len(self.activity_history)}, len2:{len(self.action_history)}")
+                    # print("action_history: ")
+                    # print(self.action_history)
+                    # print("activity_history: ")
+                    # print(self.activity_history)
                     # if input_manager.sim_calculator.detected_ui_tarpit(input_manager):
                     #     print("-------detected ui tarpit-------")
                     #     # If detected a ui tarpit
@@ -692,11 +703,13 @@ class LLMPolicy(KeaInputPolicy):        # use LLM to generate input when detecte
                     #     print("-------not detected ui tarpit-------")
                     #     event = self.generate_llm_event()
 
-                self.activity_history.append(self.from_state.foreground_activity)
-                self.activity_set.add(self.from_state.foreground_activity)
-
                 if event is not None:
-                    self.device.save_screenshot_for_report(event=event, current_state=self.from_state)
+                    try:
+                        self.device.save_screenshot_for_report(event=event, current_state=self.from_state)
+                    except Exception as e:
+                        self.logger.error("SaveScreenshotForReport failed: %s", e)
+                        self.from_state = self.device.get_current_state()
+                        self.device.save_screenshot_for_report(event=event, current_state=self.from_state)
                     input_manager.add_event(event)
                 self.to_state = self.device.get_current_state()
                 self.last_event = event
@@ -755,7 +768,6 @@ Just reply with "yes" or "no", and do not respond with any other words
         print("response:", response)
         return True
         return response == "yes"
-
 
 
     def generate_llm_event(self):
@@ -970,7 +982,7 @@ Just reply with "yes" or "no", and do not respond with any other words
         question = "Which action should I choose next? Just return the action id and nothing else.\nIf no more action is needed, return -1."
         prompt = f"{task_prompt}\n{state_prompt}\n{visisted_page_prompt}\n{history_prompt}\n{question}"
         print("-----queryllm-----")
-        print(prompt)
+        print("prompt: ", prompt)
         response = self._query_llm(prompt)
         print("-----llm-response-----")
         print(f"response: {response}")
@@ -987,7 +999,7 @@ Just reply with "yes" or "no", and do not respond with any other words
             view_text = current_state.get_view_desc(selected_action.view)
             question = f"What text should I enter to the {view_text}? Just return the text and nothing else."
             prompt = f"{task_prompt}\n{state_prompt}\n{question}"
-            print(prompt)
+            print("prompt: ", prompt)
             response = self._query_llm(prompt)
             print(f"response: {response}")
             selected_action.text = response.replace('"', "")
