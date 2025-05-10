@@ -673,16 +673,37 @@ class LLMPolicy(KeaInputPolicy):        # use LLM to generate input when detecte
                         in_tarpit = self.check_ui_tarpit()
                     if in_tarpit:
                         print("-------detected ui tarpit-------")
-                        event = self.generate_llm_event()
+                        # event = self.generate_llm_event()
+                        event = self.llm_jump_event()
                     else:
                         event = self.generate_random_event()
 
                     self.activity_history.append(self.from_state.foreground_activity)
                     self.activity_set.add(self.from_state.foreground_activity)
+
+                    state_desc, activity, indexed_views = self.from_state.get_text_representation()
+                    self.page_history.append(state_desc)
+                    # print("-----------------------pages--------------------------")
+                    # print(state_desc)
+                    # print("-----------------------pages--------------------------")
                     if len(self.activity_history) == len(self.action_history)+1 :
-                        self.action_history.append(event.__str__())
+                        # self.action_history.append(event.__str__())
+                        desc = self.from_state.get_action_desc(event)
+                        if desc == None:
+                            desc = ""
+                        self.action_history.append(desc)
+                        # print()
+                        # print()
+                        # print("---------------desc------------------")
+                        # print(event.__str__())
+                        # print("-------------------------------------")
+                        # print(self.from_state.get_action_desc(event))
+                        # print("---------------pass------------------")
+                        # print()
+                        # print()
+
                     
-                    print(f"len1:{len(self.activity_history)}, len2:{len(self.action_history)}")
+                    # print(f"len1:{len(self.activity_history)}, len2:{len(self.action_history)}")
                     # print("action_history: ")
                     # print(self.action_history)
                     # print("activity_history: ")
@@ -743,11 +764,13 @@ class LLMPolicy(KeaInputPolicy):        # use LLM to generate input when detecte
         self.tear_down()
 
     def check_ui_tarpit(self):
+        # return True
         # 构造LLM提示词
         recent_pages = []
-        for i in range(min(20, len(self.page_history)), 0, -1):
+        window_size = min(config.window_size, len(self.page_history))
+        for i in range(window_size, 0, -1):
             recent_pages.append(
-                f"{min(20, len(self.page_history))-i+1}:"
+                f"{window_size-i+1}:"
                 +self.page_history[-i]
                 # +self.action_history[-i]
             )
@@ -758,7 +781,7 @@ The current application may have fallen into a ui tar pit, such as the following
 2. Logging out results in the inability to continue the effective test
 3. Random tests fail to provide valid form content, resulting in the inability to proceed to the next page
 4. Random tests keep looping between two or three pages and it's very difficult to break out of the loop
-The following are the information and operations performed on the last {len(pages)} pages:
+The following are the information and operations performed on the last {window_size} pages:
 {pages}
 Please help me determine whether the application has fallen into the UI tar pit. 
 Just reply with "yes" or "no", and do not respond with any other words
@@ -766,9 +789,200 @@ Just reply with "yes" or "no", and do not respond with any other words
         response = self._query_llm(prompt)
         print("prompt:", prompt)
         print("response:", response)
-        return True
+        # return True
         return response == "yes"
 
+    def llm_jump_event(self):
+        if self.event_count == START_TO_GENERATE_EVENT_IN_POLICY or isinstance(self.last_event, ReInstallAppEvent):
+            self.run_initializer()
+            self.from_state = self.device.get_current_state()
+        current_state = self.from_state
+        if current_state is None:
+            time.sleep(5)
+            return KeyEvent(name="BACK")
+
+        if (self.event_count % self.number_of_events_that_restart_app == 0 and self.clear_and_reinstall_app):
+            self.logger.info(f"clear and restart app after {self.number_of_events_that_restart_app} events")
+            return ReInstallAppEvent(self.app)
+
+        rules_to_check = self.kea.get_rules_whose_preconditions_are_satisfied()
+        for rule_to_check in rules_to_check:
+            self.statistics_of_rules[str(rule_to_check.function.__name__)][
+                RULE_STATE.PRECONDITION_SATISFIED
+            ] += 1
+
+        if len(rules_to_check) > 0:
+            t = self.time_recoder.get_time_duration()
+            self.time_needed_to_satisfy_precondition.append(t)
+            self.logger.debug(
+                "has rule that matches the precondition and the time duration is "
+                + t
+            )
+            if random.random() < 0.5:
+                self.logger.info("Check property")
+                self.check_rule_whose_precondition_are_satisfied()
+                if self.restart_app_after_check_property:
+                    self.logger.debug("restart app after check property")
+                    return KillAppEvent(app=self.app)
+                return None
+            else:
+                self.logger.info("Found exectuable property in current state. No property will be checked now according to the random checking policy.")
+        # return self.generate_random_event_based_on_current_state()
+        event = self.llm_jump_event_based_on_utg()
+
+        if isinstance(event, RotateDevice):
+            if self.last_rotate_events == KEY_RotateDeviceToPortraitEvent:
+                self.last_rotate_events = KEY_RotateDeviceToLandscapeEvent
+                event = RotateDeviceToLandscapeEvent()
+            else:
+                self.last_rotate_events = KEY_RotateDeviceToPortraitEvent
+                event = RotateDeviceToPortraitEvent()
+        return event
+    
+    def llm_jump_event_based_on_utg(self):
+        current_state = self.from_state
+        self.logger.info("Current state: %s" % current_state.state_str)
+
+        if current_state.get_app_activity_depth(self.app) < 0:
+            # If the app is not in the activity stack
+            start_app_intent = self.app.get_start_intent()
+            # It seems the app stucks at some state, has been
+            # 1) force stopped (START, STOP)
+            #    just start the app again by increasing self.__num_restarts
+            # 2) started at least once and cannot be started (START)
+            #    pass to let viewclient deal with this case
+            # 3) nothing
+            #    a normal start. clear self.__num_restarts.
+            if self._event_trace.endswith(EVENT_FLAG_START_APP + EVENT_FLAG_STOP_APP) or self._event_trace.endswith(EVENT_FLAG_START_APP):
+                self._num_restarts += 1
+                self.logger.info(f"The app had been restarted {self._num_restarts} times.")
+            else:
+                self._num_restarts = 0
+            # pass (START) through
+            if not self._event_trace.endswith(EVENT_FLAG_START_APP):
+                if self._num_restarts > MAX_NUM_RESTARTS:
+                    # If the app had been restarted too many times, enter random mode
+                    msg = "The app had been restarted too many times. Entering random mode."
+                    self.logger.info(msg)
+                    self.__random_explore = True
+                else:
+                    # Start the app
+                    self._event_trace += EVENT_FLAG_START_APP
+                    self.logger.info("Trying to start the app...")
+                    self.action_history = [f"- start the app {self.app.app_name}"]
+                    return IntentEvent(intent=start_app_intent)
+        elif current_state.get_app_activity_depth(self.app) > 0:
+            # If the app is in activity stack but is not in foreground
+            self.__num_steps_outside += 1
+
+            if self.__num_steps_outside > MAX_NUM_STEPS_OUTSIDE:
+                # If the app has not been in foreground for too long, try to go back
+                if self.__num_steps_outside > MAX_NUM_STEPS_OUTSIDE_KILL:
+                    stop_app_intent = self.app.get_stop_intent()
+                    go_back_event = IntentEvent(stop_app_intent)
+                else:
+                    go_back_event = KeyEvent(name="BACK")
+                self._event_trace += EVENT_FLAG_NAVIGATE
+                self.logger.info("Going back to the app...")
+                self.action_history.append("- go back")
+                return go_back_event
+        else:
+            # If the app is in foreground
+            self.__num_steps_outside = 0
+
+        action, candidate_actions = self._get_jump_action_with_LLM(
+            current_state,
+            self.action_history,
+            self.activity_set,
+        )
+
+        if action is not None:
+            self.action_history.append(current_state.get_action_desc(action))
+            return action
+
+        if self.__random_explore:
+            self.logger.info("Trying random event...")
+            action = random.choice(candidate_actions)
+            self.action_history.append(current_state.get_action_desc(action))
+            return action
+
+        # If couldn't find a exploration target, stop the app
+        stop_app_intent = self.app.get_stop_intent()
+        self.logger.info("Cannot find an exploration target. Trying to restart app...")
+        self.action_history.append("- stop the app")
+        self._event_trace += EVENT_FLAG_STOP_APP
+        return IntentEvent(intent=stop_app_intent)
+
+    def _get_jump_action_with_LLM(self, current_state, action_history, activity_set):
+        activity = current_state.foreground_activity
+        prompt = (
+            self.task
+            + f"Currently, the App is stuck on the {activity} page, unable to explore more features. You task is to select an action based on the current GUI Infomation to perform next and help the app escape the UI tarpit."
+            + "\n"
+        )
+        recent_pages = []
+        recent_actions = []
+        window_size = min(config.window_size, len(self.page_history))
+        for i in range(window_size, 0, -1):
+            recent_pages.append(
+                f"{window_size-i+1}:"
+                +self.page_history[-i]
+                # +self.action_history[-i]
+            )
+            recent_actions.append(
+                f"{window_size-i+1}:"
+                +self.action_history[-i]
+            )
+        pages = "\n".join(recent_pages)
+        actions = "\n".join(recent_actions)
+        state_prompt, candidate_actions = current_state.get_described_actions()
+        prompt += state_prompt+"\n\n"
+        prompt += f"""The following are the information and operations performed on the last {window_size} pages:\n{pages}\n"""
+        prompt += actions+"\n"
+        prompt += "Which action should I choose next? Just return the action id and nothing else.\nIf no more action is needed, return -1."
+
+        # visisted_page_prompt = (
+        #     f"I have already visited the following activities: \n"
+        #     + "\n".join(activity_set)
+        # )
+        # # all_history_prompt = f'I have already completed the following actions to explore the app: \n' + '\n'.join(all_action_history)
+        # history_prompt = (
+        #     f"I have already completed the following steps to leave {activity} page but failed: \n "
+        #     + ";\n ".join(action_history)
+        # )
+        
+        # question = "Which action should I choose next? Just return the action id and nothing else.\nIf no more action is needed, return -1."
+        # prompt = f"{task_prompt}\n{state_prompt}\n{visisted_page_prompt}\n{history_prompt}\n{question}"
+
+        print("-----queryllm-----")
+        print("prompt: ", prompt)
+        response = self._query_llm(prompt)
+        print("-----llm-response-----")
+        print(f"response: {response}")
+        if response == "-1":
+            print("-----llm-response-failed-----")
+            return None, candidate_actions
+        
+        match = re.search(r"\d+", response)
+        if not match:
+            return None, candidate_actions
+        idx = int(match.group(0))
+        selected_action = candidate_actions[idx]
+        if isinstance(selected_action, SetTextEvent):
+            view_text = current_state.get_view_desc(selected_action.view)
+            question = f"What text should I enter to the {view_text}? Just return the text and nothing else."
+            # prompt = f"{task_prompt}\n{state_prompt}\n{question}"
+            prompt = (self.task
+                    + f"Currently, the App is stuck on the {activity} page, unable to explore more features. You task is to select an action based on the current GUI Infomation to perform next and help the app escape the UI tarpit."
+                    + "\n")
+            prompt += f"{state_prompt}\n{question}\n"
+            print("prompt: ", prompt)
+            response = self._query_llm(prompt)
+            print(f"response: {response}")
+            selected_action.text = response.replace('"', "")
+            if len(selected_action.text) > 30:  # heuristically disable long text input
+                selected_action.text = ""
+        return selected_action, candidate_actions
 
     def generate_llm_event(self):
         if self.event_count == START_TO_GENERATE_EVENT_IN_POLICY or isinstance(self.last_event, ReInstallAppEvent):
@@ -938,8 +1152,6 @@ Just reply with "yes" or "no", and do not respond with any other words
         event = self.generate_random_event_based_on_current_state()
         return event
     
-    
-
     def _query_llm(self, prompt, model = "hunyuan-turbo-latest"):
         cred = credential.Credential(config.secret_id, config.secret_key)
         client = hunyuan_client.HunyuanClient(cred, "")
@@ -966,17 +1178,17 @@ Just reply with "yes" or "no", and do not respond with any other words
     def _get_action_with_LLM(self, current_state, action_history, activity_set):
         activity = current_state.foreground_activity
         task_prompt = (
-                self.task
-                + f"Currently, the App is stuck on the {activity} page, unable to explore more features. You task is to select an action based on the current GUI Infomation to perform next and help the app escape the UI tarpit."
+            self.task
+            + f"Currently, the App is stuck on the {activity} page, unable to explore more features. You task is to select an action based on the current GUI Infomation to perform next and help the app escape the UI tarpit."
         )
         visisted_page_prompt = (
-                f"I have already visited the following activities: \n"
-                + "\n".join(activity_set)
+            f"I have already visited the following activities: \n"
+            + "\n".join(activity_set)
         )
         # all_history_prompt = f'I have already completed the following actions to explore the app: \n' + '\n'.join(all_action_history)
         history_prompt = (
-                f"I have already completed the following steps to leave {activity} page but failed: \n "
-                + ";\n ".join(action_history)
+            f"I have already completed the following steps to leave {activity} page but failed: \n "
+            + ";\n ".join(action_history)
         )
         state_prompt, candidate_actions = current_state.get_described_actions()
         question = "Which action should I choose next? Just return the action id and nothing else.\nIf no more action is needed, return -1."
@@ -1006,8 +1218,10 @@ Just reply with "yes" or "no", and do not respond with any other words
             if len(selected_action.text) > 30:  # heuristically disable long text input
                 selected_action.text = ""
         return selected_action, candidate_actions
+
     def get_last_state(self):
         return self.from_state
+    
     def clear_history(self):
         self.action_history = []
         self.activity_history = []
